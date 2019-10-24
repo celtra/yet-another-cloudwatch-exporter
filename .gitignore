@@ -1,4 +1,5 @@
 config.yml
+!.circleci/config.yml
 yet-another-cloudwatch-exporter
 vendor
 dist
