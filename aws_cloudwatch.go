@@ -27,17 +27,21 @@ type cloudwatchInterface struct {
 }
 
 type cloudwatchData struct {
-	ID                     *string
-	Metric                 *string
-	Service                *string
-	Statistics             []string
-	Points                 []*cloudwatch.Datapoint
-	NilToZero              *bool
-	AddCloudwatchTimestamp *bool
-	CustomTags             []tag
-	Tags                   []tag
-	Dimensions             []*cloudwatch.Dimension
-	Region                 *string
+	ID                      *string
+	MetricID                *string
+	Metric                  *string
+	Service                 *string
+	Statistics              []string
+	Points                  []*cloudwatch.Datapoint
+	GetMetricDataPoint      *float64
+	GetMetricDataTimestamps *time.Time
+	NilToZero               *bool
+	AddCloudwatchTimestamp  *bool
+	CustomTags              []tag
+	Tags                    []tag
+	Dimensions              []*cloudwatch.Dimension
+	Region                  *string
+	Period                  *int64
 }
 
 func createCloudwatchSession(region *string, roleArn string) *cloudwatch.CloudWatch {
@@ -100,6 +104,49 @@ func createGetMetricStatisticsInput(dimensions []*cloudwatch.Dimension, namespac
 	return output
 }
 
+func findGetMetricDataById(getMetricDatas []cloudwatchData, value string) (cloudwatchData, error) {
+	var g cloudwatchData
+	for _, getMetricData := range getMetricDatas {
+		if *getMetricData.MetricID == value {
+			return getMetricData, nil
+		}
+	}
+	return g, fmt.Errorf("Metric with id %s not found", value)
+}
+
+func createGetMetricDataInput(getMetricData []cloudwatchData, namespace *string, length int, delay int) (output *cloudwatch.GetMetricDataInput) {
+	var metricsDataQuery []*cloudwatch.MetricDataQuery
+	for _, data := range getMetricData {
+		meticStat := &cloudwatch.MetricStat{
+			Metric: &cloudwatch.Metric{
+				Dimensions: data.Dimensions,
+				MetricName: data.Metric,
+				Namespace:  namespace,
+			},
+			Period: data.Period,
+			Stat:   &data.Statistics[0],
+		}
+		ReturnData := true
+		metricsDataQuery = append(metricsDataQuery, &cloudwatch.MetricDataQuery{
+			Id:         data.MetricID,
+			MetricStat: meticStat,
+			ReturnData: &ReturnData,
+		})
+
+	}
+	endTime := time.Now().Add(-time.Duration(delay) * time.Second)
+	startTime := time.Now().Add(-(time.Duration(length) + time.Duration(delay)) * time.Second)
+	dataPointOrder := "TimestampDescending"
+	output = &cloudwatch.GetMetricDataInput{
+		EndTime:           &endTime,
+		StartTime:         &startTime,
+		MetricDataQueries: metricsDataQuery,
+		ScanBy:            &dataPointOrder,
+	}
+
+	return output
+}
+
 func createListMetricsInput(dimensions []*cloudwatch.Dimension, namespace *string, metricsName *string) (output *cloudwatch.ListMetricsInput) {
 	var dimensionsFilter []*cloudwatch.DimensionFilter
 
@@ -150,12 +197,35 @@ func (iface cloudwatchInterface) get(filter *cloudwatch.GetMetricStatisticsInput
 	}
 
 	cloudwatchAPICounter.Inc()
+	cloudwatchGetMetricStatisticsAPICounter.Inc()
 
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	return resp.Datapoints
+}
+
+func (iface cloudwatchInterface) getMetricData(filter *cloudwatch.GetMetricDataInput) *cloudwatch.GetMetricDataOutput {
+	c := iface.client
+
+	if *debug {
+		log.Println(filter)
+	}
+
+	resp, err := c.GetMetricData(filter)
+
+	if *debug {
+		log.Println(resp)
+	}
+
+	cloudwatchAPICounter.Inc()
+	cloudwatchGetMetricDataAPICounter.Inc()
+
+	if err != nil {
+		panic(err)
+	}
+	return resp
 }
 
 func getNamespace(service *string) *string {
@@ -175,6 +245,8 @@ func getNamespace(service *string) *string {
 		ns = "AWS/EC2"
 	case "ecs-svc":
 		ns = "AWS/ECS"
+	case "ecs-containerinsights":
+		ns = "ECS/ContainerInsights"
 	case "efs":
 		ns = "AWS/EFS"
 	case "elb":
@@ -277,13 +349,19 @@ func getMetricsList(dimensions []*cloudwatch.Dimension, serviceName *string, met
 		}
 	}
 	if callListMetrics {
-		req, res := c.ListMetricsRequest(filter)
+		var res cloudwatch.ListMetricsOutput
+		err := c.ListMetricsPages(filter,
+			func(page *cloudwatch.ListMetricsOutput, lastPage bool) bool {
+				for _, metric := range page.Metrics {
+					res.Metrics = append(res.Metrics, metric)
+				}
+				return !lastPage
+			})
 		cloudwatchAPICounter.Inc()
-		err := req.Send()
 		if err != nil {
 			log.Fatal(err)
 		}
-		resp = filterMetricsBasedOnDimensions(dimensions, res)
+		resp = filterMetricsBasedOnDimensions(dimensions, &res)
 	} else {
 		resp = createListMetricsOutput(dimensions, getNamespace(serviceName), &metric.Name)
 	}
@@ -332,7 +410,7 @@ func detectDimensionsByService(service *string, resourceArn *string, clientCloud
 		dimensions = buildBaseDimension(arnParsed.Resource, "CacheClusterId", "cluster:")
 	case "ec2":
 		dimensions = buildBaseDimension(arnParsed.Resource, "InstanceId", "instance/")
-	case "ecs-svc":
+	case "ecs-svc", "ecs-containerinsights":
 		parsedResource := strings.Split(arnParsed.Resource, "/")
 		if parsedResource[0] == "service" {
 			dimensions = append(dimensions, buildDimension("ClusterName", parsedResource[1]), buildDimension("ServiceName", parsedResource[2]))
@@ -432,57 +510,63 @@ func fixServiceName(serviceName *string, dimensions []*cloudwatch.Dimension) str
 
 func migrateCloudwatchToPrometheus(cwd []*cloudwatchData) []*PrometheusMetric {
 	output := make([]*PrometheusMetric, 0)
+
 	for _, c := range cwd {
 		for _, statistic := range c.Statistics {
 			name := "aws_" + fixServiceName(c.Service, c.Dimensions) + "_" + strings.ToLower(promString(*c.Metric)) + "_" + strings.ToLower(promString(statistic))
-
-			datapoints := c.Points
-			// sorting by timestamps so we can consistently export the most updated datapoint
-			// assuming Timestamp field in cloudwatch.Datapoint struct is never nil
-			sort.Slice(datapoints, func(i, j int) bool {
-				jTimestamp := *datapoints[j].Timestamp
-				return datapoints[i].Timestamp.Before(jTimestamp)
-			})
-
 			var exportedDatapoint *float64
 			var averageDataPoints []*float64
 			var timestamp time.Time
-			for _, datapoint := range datapoints {
-				switch {
-				case statistic == "Average":
-					if datapoint.Average != nil {
-						if datapoint.Timestamp.After(timestamp) {
+			if c.GetMetricDataPoint != nil {
+				exportedDatapoint = c.GetMetricDataPoint
+				timestamp = *c.GetMetricDataTimestamps
+			} else {
+				datapoints := c.Points
+				// sorting by timestamps so we can consistently export the most updated datapoint
+				// assuming Timestamp field in cloudwatch.Datapoint struct is never nil
+				sort.Slice(datapoints, func(i, j int) bool {
+					jTimestamp := *datapoints[j].Timestamp
+					return datapoints[i].Timestamp.Before(jTimestamp)
+				})
+
+				for _, datapoint := range datapoints {
+					switch {
+					case statistic == "Maximum":
+						if datapoint.Maximum != nil {
+							exportedDatapoint = datapoint.Maximum
 							timestamp = *datapoint.Timestamp
+							break
 						}
-						averageDataPoints = append(averageDataPoints, datapoint.Average)
+					case statistic == "Minimum":
+						if datapoint.Minimum != nil {
+							exportedDatapoint = datapoint.Minimum
+							timestamp = *datapoint.Timestamp
+							break
+						}
+					case statistic == "Sum":
+						if datapoint.Sum != nil {
+							exportedDatapoint = datapoint.Sum
+							timestamp = *datapoint.Timestamp
+							break
+						}
+					case statistic == "Average":
+						if datapoint.Average != nil {
+							if datapoint.Timestamp.After(timestamp) {
+								timestamp = *datapoint.Timestamp
+							}
+							averageDataPoints = append(averageDataPoints, datapoint.Average)
+						}
+					case percentile.MatchString(statistic):
+						if data, ok := datapoint.ExtendedStatistics[statistic]; ok {
+							exportedDatapoint = data
+							timestamp = *datapoint.Timestamp
+							break
+						}
+					default:
+						log.Fatal("Not implemented statistics: " + statistic)
 					}
-				case statistic == "Maximum":
-					if datapoint.Maximum != nil {
-						exportedDatapoint = datapoint.Maximum
-						timestamp = *datapoint.Timestamp
-						break
-					}
-				case statistic == "Minimum":
-					if datapoint.Minimum != nil {
-						exportedDatapoint = datapoint.Minimum
-						timestamp = *datapoint.Timestamp
-						break
-					}
-				case statistic == "Sum":
-					if datapoint.Sum != nil {
-						exportedDatapoint = datapoint.Sum
-						timestamp = *datapoint.Timestamp
-						break
-					}
-				case percentile.MatchString(statistic):
-					if data, ok := datapoint.ExtendedStatistics[statistic]; ok {
-						exportedDatapoint = data
-						timestamp = *datapoint.Timestamp
-						break
-					}
-				default:
-					log.Fatal("Not implemented statistics: " + statistic)
 				}
+
 			}
 
 			var exportedAverage float64

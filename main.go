@@ -29,6 +29,7 @@ var (
 		"ec",
 		"ec2",
 		"ecs-svc",
+		"ecs-containerinsights",
 		"efs",
 		"elb",
 		"emr",
@@ -69,11 +70,11 @@ func metricsHandler(w http.ResponseWriter, req *http.Request) {
 
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(NewPrometheusCollector(metrics))
-
-	if err := registry.Register(cloudwatchAPICounter); err != nil {
-		log.Fatal("Could not publish cloudwatch api metric")
+	for _, counter := range []prometheus.Counter{cloudwatchAPICounter, cloudwatchGetMetricDataAPICounter, cloudwatchGetMetricStatisticsAPICounter, resourceGroupTaggingAPICounter, autoScalingAPICounter} {
+		if err := registry.Register(counter); err != nil {
+			log.Fatal("Could not publish cloudwatch api metric")
+		}
 	}
-
 	handler := promhttp.HandlerFor(registry, promhttp.HandlerOpts{
 		DisableCompression: false,
 	})
