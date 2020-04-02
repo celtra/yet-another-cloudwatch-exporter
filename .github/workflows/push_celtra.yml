@@ -13,7 +13,7 @@ jobs:
         DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         DOCKER_REGISTRY_URL: quay.io
         DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-      run: docker login -u $DOCKER_USERNAME -p $DOCKER_PASSWORD $DOCKER_REGISTRY_URL
+      run: docker login -u="$DOCKER_USERNAME" -p="$DOCKER_PASSWORD" $DOCKER_REGISTRY_URL
     - name: Tag docker image
       run: docker tag yace quay.io/celtra/yet-another-cloudwatch-exporter:${GITHUB_REF#refs/tags/}
     - name: Build && release binaries
