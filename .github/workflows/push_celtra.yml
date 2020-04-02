@@ -1,0 +1,26 @@
+name: Build, test and publish
+on: push
+jobs:
+  buildDockerImage:
+    name: Build docker image
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@master
+    - name: Build docker image
+      run: docker build -t yace --build-arg VERSION=${{ github.event.release.tag_name }} .
+    - name: Log into docker
+      env:
+        DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        DOCKER_REGISTRY_URL: quay.io
+        DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      run: docker login -u $DOCKER_USERNAME -p $DOCKER_PASSWORD $DOCKER_REGISTRY_URL
+    - name: Tag docker image
+      run: docker tag yace quay.io/celtra/yet-another-cloudwatch-exporter:${GITHUB_REF#refs/tags/}
+    - name: Build && release binaries
+      uses: docker://goreleaser/goreleaser:v0.120.3
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        args: release
+    - name: Publish docker image
+      run: docker push quay.io/celtra/yet-another-cloudwatch-exporter
