@@ -1,4 +1,4 @@
-name: Build, test and publish
+name: Build and Publish on quay
 on: push
 jobs:
   buildDockerImage:
